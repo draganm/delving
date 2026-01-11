@@ -44,6 +44,10 @@ type X struct {
 	B string
 }
 
+func functionWithX(x *X) {
+	fmt.Println(x)
+}
+
 func main() {
 	hasDwarf, err := introspect.HasDWARFInfo()
 	if err != nil {
@@ -59,6 +63,8 @@ func main() {
 
 	fmt.Println("Starting stack introspection demo...")
 
+	fn := functionWithX
+
 	x := &X{
 		A: 1,
 		B: "hello",
@@ -68,5 +74,5 @@ func main() {
 	level1(value)
 
 	fmt.Println("\nDone!")
-	fmt.Println(x)
+	fn(x)
 }

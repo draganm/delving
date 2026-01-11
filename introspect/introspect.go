@@ -322,13 +322,495 @@ func evaluateFrameBase(loc []byte, bp uintptr) uintptr {
 	return bp
 }
 
-// readValueAtAddress reads a value at the given address and formats it based on type
-func readValueAtAddress(addr uintptr, typeName string) string {
+// maxDepth is the maximum recursion depth for reading nested values
+const maxDepth = 4
+
+// maxSliceElements is the maximum number of slice elements to display
+const maxSliceElements = 10
+
+// memberInfo holds information about a struct member from DWARF
+type memberInfo struct {
+	name    string
+	typeRef dwarf.Offset
+	offset  int64
+}
+
+// getStructMembers reads the members of a struct type from DWARF
+func getStructMembers(d *dwarf.Data, typeRef dwarf.Offset) []memberInfo {
+	reader := d.Reader()
+	reader.Seek(typeRef)
+
+	entry, err := reader.Next()
+	if err != nil || entry == nil || entry.Tag != dwarf.TagStructType {
+		return nil
+	}
+
+	if !entry.Children {
+		return nil
+	}
+
+	var members []memberInfo
+	for {
+		child, err := reader.Next()
+		if err != nil || child == nil || child.Tag == 0 {
+			break
+		}
+
+		if child.Tag == dwarf.TagMember {
+			mi := memberInfo{}
+			if name, ok := child.Val(dwarf.AttrName).(string); ok {
+				mi.name = name
+			}
+			if typeRef, ok := child.Val(dwarf.AttrType).(dwarf.Offset); ok {
+				mi.typeRef = typeRef
+			}
+			// Get member offset - can be int64 or []byte location expression
+			if offset, ok := child.Val(dwarf.AttrDataMemberLoc).(int64); ok {
+				mi.offset = offset
+			} else if locExpr, ok := child.Val(dwarf.AttrDataMemberLoc).([]byte); ok {
+				// Simple location expression: DW_OP_plus_uconst
+				if len(locExpr) > 0 && locExpr[0] == 0x23 { // DW_OP_plus_uconst
+					offset, _ := decodeULEB128(locExpr[1:])
+					mi.offset = int64(offset)
+				}
+			}
+			if mi.name != "" {
+				members = append(members, mi)
+			}
+		}
+
+		if child.Children {
+			reader.SkipChildren()
+		}
+	}
+
+	return members
+}
+
+// decodeULEB128 decodes an unsigned LEB128 value
+func decodeULEB128(data []byte) (uint64, int) {
+	var result uint64
+	var shift uint
+	var bytesRead int
+
+	for i, b := range data {
+		bytesRead = i + 1
+		result |= uint64(b&0x7f) << shift
+		shift += 7
+		if b&0x80 == 0 {
+			break
+		}
+	}
+
+	return result, bytesRead
+}
+
+// getTypeEntry retrieves a DWARF type entry
+func getTypeEntry(d *dwarf.Data, typeRef dwarf.Offset) *dwarf.Entry {
+	reader := d.Reader()
+	reader.Seek(typeRef)
+	entry, err := reader.Next()
+	if err != nil {
+		return nil
+	}
+	return entry
+}
+
+// getTypeSize gets the byte size of a type from DWARF
+func getTypeSize(d *dwarf.Data, typeRef dwarf.Offset) int64 {
+	entry := getTypeEntry(d, typeRef)
+	if entry == nil {
+		return 0
+	}
+	if size, ok := entry.Val(dwarf.AttrByteSize).(int64); ok {
+		return size
+	}
+	return 0
+}
+
+// readValueAtAddress reads a value at the given address using DWARF type information
+func readValueAtAddress(d *dwarf.Data, addr uintptr, typeRef dwarf.Offset, depth int) string {
 	defer func() {
 		if r := recover(); r != nil {
 			// Ignore panics from bad memory access
 		}
 	}()
+
+	if depth > maxDepth {
+		return "..."
+	}
+
+	entry := getTypeEntry(d, typeRef)
+	if entry == nil {
+		return "<unknown type>"
+	}
+
+	// Get the type name if available
+	typeName, _ := entry.Val(dwarf.AttrName).(string)
+
+	// Handle string type early (Go represents strings as struct with str/len fields)
+	if typeName == "string" {
+		return readStringValue(addr)
+	}
+
+	// Handle typedef by following to underlying type
+	if entry.Tag == dwarf.TagTypedef {
+		// Follow typedef to underlying type
+		if underlyingRef, ok := entry.Val(dwarf.AttrType).(dwarf.Offset); ok {
+			return readValueAtAddress(d, addr, underlyingRef, depth)
+		}
+	}
+
+	// Try to handle by type name first (for base types that might have different tags)
+	if result := tryReadByTypeName(addr, typeName); result != "" {
+		return result
+	}
+
+	switch entry.Tag {
+	case dwarf.TagPointerType:
+		return readPointerValue(d, addr, entry, depth)
+
+	case dwarf.TagStructType:
+		// Check if it's a Go string (struct with str/len fields)
+		members := getStructMembers(d, typeRef)
+		if isStringType(members) {
+			return readStringValue(addr)
+		}
+		// Check if it's a slice (Go slices are structs with specific fields)
+		if isSliceType(members) {
+			return readSliceValue(d, addr, members, depth)
+		}
+		return readStructValue(d, addr, typeRef, depth)
+
+	case dwarf.TagArrayType:
+		return readArrayValue(d, addr, entry, depth)
+
+	case dwarf.TagBaseType:
+		return readPrimitiveValue(d, addr, entry, typeName)
+
+	default:
+		// Fall back to type name matching for base types
+		return readPrimitiveValue(d, addr, entry, typeName)
+	}
+}
+
+// tryReadByTypeName attempts to read a value if the type name matches a known primitive
+func tryReadByTypeName(addr uintptr, typeName string) string {
+	switch typeName {
+	case "int", "int64":
+		val := *(*int64)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "int32":
+		val := *(*int32)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "int16":
+		val := *(*int16)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "int8":
+		val := *(*int8)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "uint", "uint64", "uintptr":
+		val := *(*uint64)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "uint32":
+		val := *(*uint32)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "uint16":
+		val := *(*uint16)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "uint8", "byte":
+		val := *(*uint8)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%d", val)
+	case "float32":
+		val := *(*float32)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%f", val)
+	case "float64":
+		val := *(*float64)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%f", val)
+	case "bool":
+		val := *(*bool)(unsafe.Pointer(addr))
+		return fmt.Sprintf("%t", val)
+	}
+	return ""
+}
+
+// readPointerValue reads a pointer and dereferences it
+func readPointerValue(d *dwarf.Data, addr uintptr, entry *dwarf.Entry, depth int) string {
+	ptrVal := *(*uintptr)(unsafe.Pointer(addr))
+
+	if ptrVal == 0 {
+		return "nil"
+	}
+
+	// Get the underlying type
+	underlyingRef, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
+	if !ok {
+		return fmt.Sprintf("0x%x", ptrVal)
+	}
+
+	// Read the dereferenced value
+	derefValue := readValueAtAddress(d, ptrVal, underlyingRef, depth+1)
+	return "&" + derefValue
+}
+
+// readStructValue reads a struct's fields
+func readStructValue(d *dwarf.Data, addr uintptr, typeRef dwarf.Offset, depth int) string {
+	members := getStructMembers(d, typeRef)
+	if len(members) == 0 {
+		return "{}"
+	}
+
+	var parts []string
+	for _, m := range members {
+		fieldAddr := addr + uintptr(m.offset)
+		fieldValue := readValueAtAddress(d, fieldAddr, m.typeRef, depth+1)
+		parts = append(parts, fmt.Sprintf("%s: %s", m.name, fieldValue))
+	}
+
+	return "{" + joinStrings(parts, ", ") + "}"
+}
+
+// isSliceType checks if the struct members represent a Go slice
+func isSliceType(members []memberInfo) bool {
+	if len(members) != 3 {
+		return false
+	}
+	// Go slice has: array (pointer), len (int), cap (int)
+	hasArray := false
+	hasLen := false
+	hasCap := false
+	for _, m := range members {
+		switch m.name {
+		case "array":
+			hasArray = true
+		case "len":
+			hasLen = true
+		case "cap":
+			hasCap = true
+		}
+	}
+	return hasArray && hasLen && hasCap
+}
+
+// isStringType checks if the struct members represent a Go string
+func isStringType(members []memberInfo) bool {
+	if len(members) != 2 {
+		return false
+	}
+	hasStr := false
+	hasLen := false
+	for _, m := range members {
+		switch m.name {
+		case "str":
+			hasStr = true
+		case "len":
+			hasLen = true
+		}
+	}
+	return hasStr && hasLen
+}
+
+// maxStringLen is the maximum number of bytes to read from a string
+const maxStringLen = 256
+
+// readStringValue reads a Go string from memory
+func readStringValue(addr uintptr) string {
+	type stringHeader struct {
+		Data uintptr
+		Len  int
+	}
+	hdr := *(*stringHeader)(unsafe.Pointer(addr))
+
+	if hdr.Len == 0 {
+		return `""`
+	}
+
+	// Check if data pointer looks valid (not too small to be a real pointer)
+	if hdr.Data < 0x1000 {
+		return fmt.Sprintf("<invalid string Data=0x%x Len=%d>", hdr.Data, hdr.Len)
+	}
+
+	// Cap the length at maxStringLen
+	readLen := hdr.Len
+	truncated := false
+	if readLen > maxStringLen {
+		readLen = maxStringLen
+		truncated = true
+	}
+	if readLen < 0 {
+		return fmt.Sprintf("<invalid string Data=0x%x Len=%d>", hdr.Data, hdr.Len)
+	}
+
+	// Try to read the bytes
+	bytes := make([]byte, readLen)
+	for i := 0; i < readLen; i++ {
+		bytes[i] = *(*byte)(unsafe.Pointer(hdr.Data + uintptr(i)))
+	}
+
+	// Format as string with non-printable chars hex-encoded
+	result := formatStringBytes(bytes)
+	if truncated {
+		result += "..."
+	}
+
+	return `"` + result + `"`
+}
+
+// formatStringBytes formats bytes as a string, hex-encoding non-printable characters
+func formatStringBytes(data []byte) string {
+	var result []byte
+	for _, b := range data {
+		if b >= 32 && b < 127 {
+			// Printable ASCII
+			if b == '"' || b == '\\' {
+				result = append(result, '\\', b)
+			} else {
+				result = append(result, b)
+			}
+		} else if b == '\n' {
+			result = append(result, '\\', 'n')
+		} else if b == '\r' {
+			result = append(result, '\\', 'r')
+		} else if b == '\t' {
+			result = append(result, '\\', 't')
+		} else {
+			// Hex encode non-printable
+			result = append(result, fmt.Sprintf("\\x%02x", b)...)
+		}
+	}
+	return string(result)
+}
+
+// readSliceValue reads a slice header and its elements
+func readSliceValue(d *dwarf.Data, addr uintptr, members []memberInfo, depth int) string {
+	// Read slice header fields
+	var dataPtr uintptr
+	var sliceLen, sliceCap int64
+
+	for _, m := range members {
+		fieldAddr := addr + uintptr(m.offset)
+		switch m.name {
+		case "array":
+			dataPtr = *(*uintptr)(unsafe.Pointer(fieldAddr))
+		case "len":
+			sliceLen = *(*int64)(unsafe.Pointer(fieldAddr))
+		case "cap":
+			sliceCap = *(*int64)(unsafe.Pointer(fieldAddr))
+		}
+	}
+
+	if dataPtr == 0 || sliceLen == 0 {
+		return fmt.Sprintf("[](len=%d, cap=%d)", sliceLen, sliceCap)
+	}
+
+	// Get element type from the array pointer
+	var elemTypeRef dwarf.Offset
+	var elemSize int64
+	for _, m := range members {
+		if m.name == "array" {
+			ptrEntry := getTypeEntry(d, m.typeRef)
+			if ptrEntry != nil && ptrEntry.Tag == dwarf.TagPointerType {
+				if ref, ok := ptrEntry.Val(dwarf.AttrType).(dwarf.Offset); ok {
+					elemTypeRef = ref
+					elemSize = getTypeSize(d, elemTypeRef)
+				}
+			}
+			break
+		}
+	}
+
+	if elemSize == 0 {
+		elemSize = 8 // Default to pointer size
+	}
+
+	// Read elements
+	numToShow := sliceLen
+	if numToShow > maxSliceElements {
+		numToShow = maxSliceElements
+	}
+
+	var elems []string
+	for i := int64(0); i < numToShow; i++ {
+		elemAddr := dataPtr + uintptr(i*elemSize)
+		elemValue := readValueAtAddress(d, elemAddr, elemTypeRef, depth+1)
+		elems = append(elems, elemValue)
+	}
+
+	result := "[" + joinStrings(elems, ", ")
+	if sliceLen > maxSliceElements {
+		result += ", ..."
+	}
+	result += "]"
+
+	return fmt.Sprintf("(len=%d, cap=%d)%s", sliceLen, sliceCap, result)
+}
+
+// readArrayValue reads an array's elements
+func readArrayValue(d *dwarf.Data, addr uintptr, entry *dwarf.Entry, depth int) string {
+	// Get element type
+	elemTypeRef, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
+	if !ok {
+		return "[...]"
+	}
+
+	elemSize := getTypeSize(d, elemTypeRef)
+	if elemSize == 0 {
+		elemSize = 8
+	}
+
+	// Get array length from DWARF (from subrange child)
+	reader := dwarfData.Reader()
+	reader.Seek(entry.Offset)
+	reader.Next() // skip the array entry itself
+
+	var arrayLen int64 = 0
+	if entry.Children {
+		child, err := reader.Next()
+		if err == nil && child != nil && child.Tag == dwarf.TagSubrangeType {
+			if count, ok := child.Val(dwarf.AttrCount).(int64); ok {
+				arrayLen = count
+			} else if upper, ok := child.Val(dwarf.AttrUpperBound).(int64); ok {
+				arrayLen = upper + 1
+			}
+		}
+	}
+
+	if arrayLen == 0 {
+		return "[...]"
+	}
+
+	numToShow := arrayLen
+	if numToShow > maxSliceElements {
+		numToShow = maxSliceElements
+	}
+
+	var elems []string
+	for i := int64(0); i < numToShow; i++ {
+		elemAddr := addr + uintptr(i*elemSize)
+		elemValue := readValueAtAddress(d, elemAddr, elemTypeRef, depth+1)
+		elems = append(elems, elemValue)
+	}
+
+	result := "[" + joinStrings(elems, ", ")
+	if arrayLen > maxSliceElements {
+		result += ", ..."
+	}
+	result += "]"
+
+	return result
+}
+
+// readPrimitiveValue reads primitive types by name
+func readPrimitiveValue(d *dwarf.Data, addr uintptr, entry *dwarf.Entry, typeName string) string {
+	// For typedef, follow to the underlying type
+	if entry.Tag == dwarf.TagTypedef {
+		if underlyingRef, ok := entry.Val(dwarf.AttrType).(dwarf.Offset); ok {
+			underlyingEntry := getTypeEntry(d, underlyingRef)
+			if underlyingEntry != nil {
+				return readPrimitiveValue(d, addr, underlyingEntry, typeName)
+			}
+		}
+	}
 
 	switch typeName {
 	case "int", "int64":
@@ -379,16 +861,42 @@ func readValueAtAddress(addr uintptr, typeName string) string {
 		}
 		return `""`
 	default:
-		if len(typeName) > 0 && typeName[0] == '*' {
-			val := *(*uintptr)(unsafe.Pointer(addr))
-			return fmt.Sprintf("0x%x", val)
+		// Unknown type - read raw bytes based on size
+		size := getTypeSize(d, entry.Offset)
+		if size == 0 {
+			size = 8
 		}
-		bytes := make([]byte, 8)
-		for i := 0; i < 8; i++ {
-			bytes[i] = *(*byte)(unsafe.Pointer(addr + uintptr(i)))
+		if size <= 8 {
+			bytes := make([]byte, size)
+			for i := int64(0); i < size; i++ {
+				bytes[i] = *(*byte)(unsafe.Pointer(addr + uintptr(i)))
+			}
+			return fmt.Sprintf("0x%x", binary.LittleEndian.Uint64(padToEight(bytes)))
 		}
-		return fmt.Sprintf("0x%x", binary.LittleEndian.Uint64(bytes))
+		return fmt.Sprintf("<size=%d>", size)
 	}
+}
+
+// padToEight pads a byte slice to 8 bytes
+func padToEight(b []byte) []byte {
+	if len(b) >= 8 {
+		return b[:8]
+	}
+	result := make([]byte, 8)
+	copy(result, b)
+	return result
+}
+
+// joinStrings joins strings with a separator (simple implementation to avoid strings import)
+func joinStrings(parts []string, sep string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	result := parts[0]
+	for i := 1; i < len(parts); i++ {
+		result += sep + parts[i]
+	}
+	return result
 }
 
 // getFramePointers returns the base pointers for each frame in the call stack
@@ -477,7 +985,7 @@ func FprintStackVariables(w io.Writer) {
 
 				if isFbreg && frameBase != 0 {
 					addr := uintptr(int64(frameBase) + offset)
-					value := readValueAtAddress(addr, typeName)
+					value := readValueAtAddress(d, addr, v.typeRef, 0)
 					fmt.Fprintf(w, "      %s (%s) = %s\n", v.name, typeName, value)
 				} else {
 					fmt.Fprintf(w, "      %s (%s) = <location unavailable>\n", v.name, typeName)
