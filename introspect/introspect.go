@@ -467,6 +467,9 @@ func readValueAtAddress(d *dwarf.Data, addr uintptr, typeRef dwarf.Offset, depth
 	}
 
 	switch entry.Tag {
+	case dwarf.TagSubroutineType:
+		return readFuncValue(addr)
+
 	case dwarf.TagPointerType:
 		return readPointerValue(d, addr, entry, depth)
 
@@ -548,9 +551,60 @@ func readPointerValue(d *dwarf.Data, addr uintptr, entry *dwarf.Entry, depth int
 		return fmt.Sprintf("0x%x", ptrVal)
 	}
 
+	// Check if this is a pointer to a function
+	underlyingEntry := getTypeEntry(d, underlyingRef)
+	if underlyingEntry != nil && underlyingEntry.Tag == dwarf.TagSubroutineType {
+		return readFuncPtrValue(ptrVal)
+	}
+
 	// Read the dereferenced value
 	derefValue := readValueAtAddress(d, ptrVal, underlyingRef, depth+1)
 	return "&" + derefValue
+}
+
+// readFuncValue reads a function value (which in Go is a pointer to a funcval struct)
+func readFuncValue(addr uintptr) string {
+	// In Go, a func value is a pointer to a runtime.funcval struct
+	// The funcval struct's first field is the function pointer (fn uintptr)
+	funcvalPtr := *(*uintptr)(unsafe.Pointer(addr))
+	if funcvalPtr == 0 {
+		return "nil"
+	}
+
+	// Try to use the funcval pointer directly first (for static function references)
+	fn := runtime.FuncForPC(funcvalPtr)
+	if fn != nil {
+		// This is a direct pointer to code - format it
+		return formatFuncLocation(funcvalPtr)
+	}
+
+	// Otherwise, dereference to get the function pointer from the funcval struct
+	funcPtr := *(*uintptr)(unsafe.Pointer(funcvalPtr))
+	if funcPtr == 0 {
+		return fmt.Sprintf("func(0x%x)", funcvalPtr)
+	}
+	return formatFuncLocation(funcPtr)
+}
+
+// readFuncPtrValue reads a pointer to a function (the pointer holds the code address directly)
+func readFuncPtrValue(funcPtr uintptr) string {
+	if funcPtr == 0 {
+		return "nil"
+	}
+	return formatFuncLocation(funcPtr)
+}
+
+// formatFuncLocation formats a function pointer with its file and line location
+func formatFuncLocation(funcPtr uintptr) string {
+	fn := runtime.FuncForPC(funcPtr)
+	if fn == nil {
+		return fmt.Sprintf("func(0x%x)", funcPtr)
+	}
+
+	name := fn.Name()
+	file, line := fn.FileLine(fn.Entry())
+
+	return fmt.Sprintf("func %s (%s:%d)", name, file, line)
 }
 
 // readStructValue reads a struct's fields
