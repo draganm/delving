@@ -39,6 +39,11 @@ func level1(x int) {
 	level2(x * 2)
 }
 
+type X struct {
+	A int
+	B string
+}
+
 func main() {
 	hasDwarf, err := introspect.HasDWARFInfo()
 	if err != nil {
@@ -54,8 +59,14 @@ func main() {
 
 	fmt.Println("Starting stack introspection demo...")
 
+	x := &X{
+		A: 1,
+		B: "hello",
+	}
+
 	value := 100
 	level1(value)
 
 	fmt.Println("\nDone!")
+	fmt.Println(x)
 }
