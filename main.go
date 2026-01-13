@@ -26,17 +26,19 @@ func level2(y int) {
 	_ = local2
 	_ = name
 
+	fmt.Println(name)
+
 	level3(3.14159)
 }
 
 //go:noinline
-func level1(x int, f func(x *X)) {
+func level1(x int, f func(x *X), z *X) {
 	local1 := x + 10
 	flag := true
 	_ = local1
 	_ = flag
 
-	_ = f
+	f(z)
 
 	level2(x * 2)
 }
@@ -72,8 +74,10 @@ func main() {
 		B: "hello",
 	}
 
+	_ = fn
+
 	value := 100
-	level1(value, fn)
+	level1(value, fn, x)
 
 	fmt.Println("\nDone!")
 	fn(x)

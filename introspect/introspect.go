@@ -3,6 +3,8 @@
 package introspect
 
 import (
+	"bytes"
+	"compress/zlib"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -101,6 +103,158 @@ func loadDWARF() (*dwarf.Data, error) {
 	}
 }
 
+// debugLocData caches the .debug_loc section data
+var debugLocData []byte
+
+// loadDebugLoc loads the .debug_loc section from the binary
+func loadDebugLoc() []byte {
+	if debugLocData != nil {
+		return debugLocData
+	}
+
+	execPath, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+
+	switch runtime.GOOS {
+	case "darwin":
+		f, err := macho.Open(execPath)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		// Look for __debug_loc or __zdebug_loc (compressed) section
+		for _, sec := range f.Sections {
+			if sec.Name == "__debug_loc" {
+				data, err := sec.Data()
+				if err != nil {
+					return nil
+				}
+				debugLocData = data
+				return debugLocData
+			}
+			if sec.Name == "__zdebug_loc" {
+				data, err := sec.Data()
+				if err != nil {
+					return nil
+				}
+				// Decompress zlib-compressed section
+				debugLocData = decompressZdebug(data)
+				return debugLocData
+			}
+		}
+
+	case "linux":
+		f, err := elf.Open(execPath)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		sec := f.Section(".debug_loc")
+		if sec != nil {
+			data, err := sec.Data()
+			if err != nil {
+				return nil
+			}
+			debugLocData = data
+			return debugLocData
+		}
+		// Try compressed version
+		sec = f.Section(".zdebug_loc")
+		if sec != nil {
+			data, err := sec.Data()
+			if err != nil {
+				return nil
+			}
+			debugLocData = decompressZdebug(data)
+			return debugLocData
+		}
+	}
+
+	return nil
+}
+
+// decompressZdebug decompresses a zlib-compressed DWARF section
+// The format is: "ZLIB" magic (4 bytes) + uncompressed size (8 bytes big-endian) + zlib data
+func decompressZdebug(data []byte) []byte {
+	if len(data) < 12 {
+		return nil
+	}
+	// Check for ZLIB magic
+	if string(data[:4]) != "ZLIB" {
+		return nil
+	}
+	// Read uncompressed size (big-endian)
+	uncompressedSize := binary.BigEndian.Uint64(data[4:12])
+
+	// Decompress
+	r, err := zlib.NewReader(bytes.NewReader(data[12:]))
+	if err != nil {
+		return nil
+	}
+	defer r.Close()
+
+	result := make([]byte, uncompressedSize)
+	n, err := io.ReadFull(r, result)
+	if err != nil {
+		return nil
+	}
+	return result[:n]
+}
+
+// getLocationFromList reads a location list and returns the location expression for the given PC
+func getLocationFromList(offset int64, pc uint64) []byte {
+	data := loadDebugLoc()
+	if data == nil || offset < 0 || int(offset) >= len(data) {
+		return nil
+	}
+
+	// Read pointer size (assume 8 bytes for 64-bit)
+	ptrSize := 8
+
+	pos := int(offset)
+	for pos+2*ptrSize <= len(data) {
+		// Read begin and end addresses
+		begin := binary.LittleEndian.Uint64(data[pos : pos+ptrSize])
+		end := binary.LittleEndian.Uint64(data[pos+ptrSize : pos+2*ptrSize])
+		pos += 2 * ptrSize
+
+		// End of list marker
+		if begin == 0 && end == 0 {
+			break
+		}
+
+		// Base address selection entry (begin == max value)
+		if begin == 0xFFFFFFFFFFFFFFFF {
+			// end contains the new base address; skip for now
+			continue
+		}
+
+		// Read location expression length
+		if pos+2 > len(data) {
+			break
+		}
+		exprLen := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+		pos += 2
+
+		if pos+exprLen > len(data) {
+			break
+		}
+
+		// Check if PC falls within this range
+		if pc >= begin && pc < end {
+			return data[pos : pos+exprLen]
+		}
+
+		pos += exprLen
+	}
+
+	return nil
+}
+
 // calculateASLROffset finds the difference between runtime and DWARF addresses
 // using the PrintStackVariables function itself as a reference point
 func calculateASLROffset(d *dwarf.Data) {
@@ -140,19 +294,37 @@ func calculateASLROffset(d *dwarf.Data) {
 
 // variableInfo holds information about a variable from DWARF
 type variableInfo struct {
-	name     string
-	location []byte
-	typeRef  dwarf.Offset
+	name           string
+	location       []byte  // Simple location expression
+	locListOffset  int64   // Offset into .debug_loc section (if >= 0)
+	hasLocList     bool    // True if using location list
+	typeRef        dwarf.Offset
+}
+
+// compileUnitInfo holds information about a compile unit
+type compileUnitInfo struct {
+	lowPC uint64
 }
 
 // findFunctionAndVariables finds the function containing the given PC and returns its variables
-func findFunctionAndVariables(d *dwarf.Data, pc uint64) (funcName string, vars []variableInfo, frameBaseLoc []byte) {
+func findFunctionAndVariables(d *dwarf.Data, pc uint64) (funcName string, vars []variableInfo, frameBaseLoc []byte, cuLowPC uint64) {
 	reader := d.Reader()
+
+	// Track the current compile unit's base address
+	var currentCULowPC uint64
 
 	for {
 		entry, err := reader.Next()
 		if err != nil || entry == nil {
 			break
+		}
+
+		// Track compile unit base address for location list lookups
+		if entry.Tag == dwarf.TagCompileUnit {
+			if lpc, ok := entry.Val(dwarf.AttrLowpc).(uint64); ok {
+				currentCULowPC = lpc
+			}
+			continue
 		}
 
 		if entry.Tag == dwarf.TagSubprogram {
@@ -174,6 +346,7 @@ func findFunctionAndVariables(d *dwarf.Data, pc uint64) (funcName string, vars [
 				}
 
 				if pc >= lowPC && pc <= highPC {
+					cuLowPC = currentCULowPC
 					if name, ok := entry.Val(dwarf.AttrName).(string); ok {
 						funcName = name
 					}
@@ -197,13 +370,17 @@ func findFunctionAndVariables(d *dwarf.Data, pc uint64) (funcName string, vars [
 								if name, ok := child.Val(dwarf.AttrName).(string); ok {
 									vi.name = name
 								}
+								// Handle both simple location expressions and location lists
 								if loc, ok := child.Val(dwarf.AttrLocation).([]byte); ok {
 									vi.location = loc
+								} else if locOffset, ok := child.Val(dwarf.AttrLocation).(int64); ok {
+									vi.locListOffset = locOffset
+									vi.hasLocList = true
 								}
 								if typeRef, ok := child.Val(dwarf.AttrType).(dwarf.Offset); ok {
 									vi.typeRef = typeRef
 								}
-								if vi.name != "" && len(vi.location) > 0 {
+								if vi.name != "" && (len(vi.location) > 0 || vi.hasLocList) {
 									vars = append(vars, vi)
 								}
 							}
@@ -562,6 +739,46 @@ func readPointerValue(d *dwarf.Data, addr uintptr, entry *dwarf.Entry, depth int
 	return "&" + derefValue
 }
 
+// safeReadPtr safely reads a pointer from memory, returning 0 if the read fails
+func safeReadPtr(addr uintptr) (val uintptr, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			val = 0
+			ok = false
+		}
+	}()
+	val = *(*uintptr)(unsafe.Pointer(addr))
+	ok = true
+	return
+}
+
+// tryResolveFuncPtr attempts to resolve a function pointer using runtime.FuncForPC
+// and returns the formatted location if successful
+func tryResolveFuncPtr(ptr uintptr) (string, bool) {
+	if ptr == 0 || ptr < 0x1000 {
+		return "", false
+	}
+	fn := runtime.FuncForPC(ptr)
+	if fn != nil {
+		name := fn.Name()
+		file, line := fn.FileLine(fn.Entry())
+		return fmt.Sprintf("%s (%s:%d)", name, file, line), true
+	}
+	return "", false
+}
+
+// looksLikeValidAddr checks if an address looks like it could be valid on this platform
+func looksLikeValidAddr(addr uintptr) bool {
+	// On 64-bit systems, valid addresses are typically:
+	// - Code/rodata: 0x100000000+ on ARM64 macOS, lower on AMD64
+	// - Heap: 0x140000000+ on ARM64 macOS
+	// Reject addresses that are too low (likely garbage)
+	if runtime.GOARCH == "arm64" {
+		return addr > 0x100000000 // 4GB threshold for ARM64
+	}
+	return addr > 0x400000 // Lower threshold for AMD64
+}
+
 // readFuncValue reads a function value (which in Go is a pointer to a funcval struct)
 func readFuncValue(addr uintptr) string {
 	// In Go, a func value is a pointer to a runtime.funcval struct
@@ -571,19 +788,23 @@ func readFuncValue(addr uintptr) string {
 		return "nil"
 	}
 
-	// Try to use the funcval pointer directly first (for static function references)
-	fn := runtime.FuncForPC(funcvalPtr)
-	if fn != nil {
-		// This is a direct pointer to code - format it
-		return formatFuncLocation(funcvalPtr)
+	// Strategy 1: Try funcvalPtr directly as a code pointer
+	if loc, ok := tryResolveFuncPtr(funcvalPtr); ok {
+		return loc
 	}
 
-	// Otherwise, dereference to get the function pointer from the funcval struct
-	funcPtr := *(*uintptr)(unsafe.Pointer(funcvalPtr))
-	if funcPtr == 0 {
-		return fmt.Sprintf("func(0x%x)", funcvalPtr)
+	// Strategy 2: Dereference funcvalPtr to get fn from funcval struct
+	// Only try if the address looks like it could be valid
+	if looksLikeValidAddr(funcvalPtr) {
+		if funcPtr, ok := safeReadPtr(funcvalPtr); ok && funcPtr != 0 {
+			if loc, ok := tryResolveFuncPtr(funcPtr); ok {
+				return loc
+			}
+		}
 	}
-	return formatFuncLocation(funcPtr)
+
+	// Fallback: show the address we read
+	return fmt.Sprintf("func(0x%x)", funcvalPtr)
 }
 
 // readFuncPtrValue reads a pointer to a function (the pointer holds the code address directly)
@@ -1020,7 +1241,7 @@ func FprintStackVariables(w io.Writer) {
 
 		dwarfPC := uint64(int64(frame.PC) - aslrOffset)
 
-		funcName, vars, frameBaseLoc := findFunctionAndVariables(d, dwarfPC)
+		funcName, vars, frameBaseLoc, cuLowPC := findFunctionAndVariables(d, dwarfPC)
 
 		if funcName == "" {
 			fmt.Fprintf(w, "    (no DWARF info for this frame)\n")
@@ -1035,7 +1256,18 @@ func FprintStackVariables(w io.Writer) {
 			fmt.Fprintf(w, "    Variables:\n")
 			for _, v := range vars {
 				typeName := resolveTypeName(d, v.typeRef)
-				offset, isFbreg := evaluateLocation(v.location)
+
+				// Get the location expression (either directly or from location list)
+				var locExpr []byte
+				if v.hasLocList {
+					// Location list addresses are relative to the compile unit's base address
+					relativePC := dwarfPC - cuLowPC
+					locExpr = getLocationFromList(v.locListOffset, relativePC)
+				} else {
+					locExpr = v.location
+				}
+
+				offset, isFbreg := evaluateLocation(locExpr)
 
 				if isFbreg && frameBase != 0 {
 					addr := uintptr(int64(frameBase) + offset)
